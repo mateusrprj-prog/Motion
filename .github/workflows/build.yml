@@ -1,21 +1,77 @@
-name: Build APK
-on: [push, workflow_dispatch]
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CI: "1"
+  EXPO_NO_TELEMETRY: "1"
+
 jobs:
-  build:
+  build-apk:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: Descompactar o zip do projeto
+        with: { fetch-depth: 0 }
+
+      - name: Localizar e extrair o .zip do projeto
         run: |
-          ls *.zip
-          unzip -o *.zip -d proj
+          BEST=""; BEST_T=0
+          while IFS= read -r f; do
+            t=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
+            [ -z "$t" ] && t=0
+            if [ "$t" -ge "$BEST_T" ]; then BEST="$f"; BEST_T=$t; fi
+          done < <(find . -maxdepth 2 -name '*.zip' -not -path './node_modules/*' -not -path './.git/*')
+          if [ -z "$BEST" ]; then echo "Nenhum .zip encontrado no repositório."; exit 1; fi
+          echo "Usando: $BEST"
+          mkdir -p _project
+          unzip -q -o "$BEST" -d _project
+          PKG=$(find _project -name package.json -not -path '*/node_modules/*' | head -n1)
+          if [ -z "$PKG" ]; then echo "package.json não encontrado dentro do zip."; exit 1; fi
+          echo "APP_DIR=$(dirname "$PKG")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: 17 }
-      - uses: gradle/actions/setup-gradle@v3
-        with: { gradle-version: "8.7" }
-      - run: gradle assembleDebug
-        working-directory: proj
+
+      - name: Aceitar licenças do Android SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Instalar dependências
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          npm install --legacy-peer-deps
+          npx expo install --fix || true
+
+      - name: Gerar projeto nativo
+        working-directory: ${{ env.APP_DIR }}
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Aumentar memória do Gradle
+        working-directory: ${{ env.APP_DIR }}/android
+        run: |
+          echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" >> gradle.properties
+          echo "org.gradle.daemon=false" >> gradle.properties
+
+      - name: Compilar APK (arm64 - POCO X7 Pro)
+        working-directory: ${{ env.APP_DIR }}/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a --no-daemon --stacktrace
+
       - uses: actions/upload-artifact@v4
         with:
-          name: mmd-studio-debug
-          path: proj/app/build/outputs/apk/debug/*.apk
+          name: motion-studio-apk
+          path: ${{ env.APP_DIR }}/android/app/build/outputs/apk/release/*.apk
+
+      - name: Relatório de erro (se falhar)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: ${{ env.APP_DIR }}/android/app/build/reports
+          if-no-files-found: ignore
